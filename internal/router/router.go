@@ -6,11 +6,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
-	"sync"
-
 	"rest-geoip/internal/config"
 	"rest-geoip/internal/maxmind"
+	"strings"
+	"sync"
 
 	"github.com/didip/tollbooth/v7"
 	"github.com/didip/tollbooth_echo"
@@ -45,17 +44,45 @@ var spaFS embed.FS
 //}
 
 func geoip(c echo.Context) error {
-	db := maxmind.GetInstance()
-	r, _ := db.Lookup(net.ParseIP(c.RealIP()))
-
-	return c.JSON(http.StatusOK, r)
+	return lookupGeoIP(c, c.RealIP())
 }
 
 func geoipForAddress(c echo.Context) error {
-	db := maxmind.GetInstance()
-	r, _ := db.Lookup(net.ParseIP(c.Param("ip_address")))
+	return lookupGeoIP(c, c.Param("ip_address"))
+}
 
-	return c.JSON(http.StatusOK, r)
+func geoipCountryCodeForAddress(c echo.Context) error {
+	record, err := lookupGeoIPRecord(c.Param("ip_address"))
+	if err != nil {
+		return err
+	}
+	if record.Country.ISOCode == "" {
+		return c.String(http.StatusOK, "nil")
+	}
+	return c.String(http.StatusOK, record.Country.ISOCode)
+}
+
+func lookupGeoIP(c echo.Context, rawIP string) error {
+	record, err := lookupGeoIPRecord(rawIP)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, record)
+}
+
+func lookupGeoIPRecord(rawIP string) (maxmind.Record, error) {
+	db := maxmind.GetInstance()
+	ip := net.ParseIP(strings.TrimSpace(rawIP))
+	if ip == nil {
+		return maxmind.Record{}, echo.NewHTTPError(http.StatusBadRequest, "invalid IP address")
+	}
+
+	record, err := db.Lookup(ip)
+	if err != nil {
+		return maxmind.Record{}, echo.NewHTTPError(http.StatusInternalServerError, "error looking up geoip record")
+	}
+
+	return record, nil
 }
 
 func cliAgentHander(next echo.HandlerFunc) echo.HandlerFunc {
@@ -91,8 +118,7 @@ func InitRouter() {
 		e = echo.New()
 	})
 
-	// 3 req/s
-	limiter := tollbooth.NewLimiter(3, nil)
+	limiter := tollbooth.NewLimiter(config.Details().Program.APIRateLimit, nil)
 
 	listeningAddress := fmt.Sprintf("%s:%s", config.Details().Program.ListenAddress, config.Details().Program.ListenPort)
 
@@ -145,6 +171,7 @@ func InitRouter() {
 		return c.JSON(http.StatusOK, dto)
 	})
 	api.GET("/geoip", geoip)
+	api.GET("/geoip/cc/:ip_address", geoipCountryCodeForAddress)
 	api.GET("/geoip/:ip_address", geoipForAddress)
 	api.PUT("/update", func(c echo.Context) error {
 		var dto struct {

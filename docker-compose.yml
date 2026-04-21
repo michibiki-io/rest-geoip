@@ -1,5 +1,3 @@
-version: '3.4'
-
 services:
   rest-geoip:
     #image: twistedneil/eleven:main

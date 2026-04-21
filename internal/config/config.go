@@ -12,13 +12,14 @@ import (
 
 type config struct {
 	Program struct {
-		APIKey        string `mapstructure:"API_KEY"`
-		EnableLogging bool   `mapstructure:"ENABLE_LOGGING"`
-		EnableWeb     bool   `mapstructure:"ENABLE_WEB"`
-		ListenAddress string `mapstructure:"LISTEN_ADDRESS"`
-		ListenPort    string `mapstructure:"LISTEN_PORT"`
-		AdminNotice   string `mapstructure:"ADMIN_NOTICE"`
-		ReleaseMode   bool   `mapstructure:"RELEASE_MODE"`
+		APIKey        string  `mapstructure:"API_KEY"`
+		APIRateLimit  float64 `mapstructure:"API_RATE_LIMIT"`
+		EnableLogging bool    `mapstructure:"ENABLE_LOGGING"`
+		EnableWeb     bool    `mapstructure:"ENABLE_WEB"`
+		ListenAddress string  `mapstructure:"LISTEN_ADDRESS"`
+		ListenPort    string  `mapstructure:"LISTEN_PORT"`
+		AdminNotice   string  `mapstructure:"ADMIN_NOTICE"`
+		ReleaseMode   bool    `mapstructure:"RELEASE_MODE"`
 	} `mapstructure:"PROGRAM"`
 	Maptiler struct {
 		Token string `mapstructure:"TOKEN"`
@@ -41,6 +42,7 @@ func Init() {
 
 		// When you explicitly provide the ENV variable name (the second parameter), it does not automatically add the prefix
 		viper.BindEnv("program.api_key", "GOIP_PROGRAM__API_KEY")
+		viper.BindEnv("program.api_rate_limit", "GOIP_PROGRAM__API_RATE_LIMIT")
 		viper.BindEnv("program.enable_logging", "GOIP_PROGRAM__ENABLE_LOGGING")
 		viper.BindEnv("program.enable_web", "GOIP_PROGRAM__ENABLE_WEB")
 		viper.BindEnv("program.listen_address", "GOIP_PROGRAM__LISTEN_ADDRESS")
@@ -84,6 +86,9 @@ func Init() {
 		}
 		if programConfig.Program.ListenPort == "" {
 			programConfig.Program.ListenPort = "1323"
+		}
+		if programConfig.Program.APIRateLimit <= 0 {
+			programConfig.Program.APIRateLimit = 3
 		}
 		if programConfig.Maptiler.Token == "" {
 			programConfig.Maptiler.Token = "if_you're_seeing_this_replace_me_in_env_var"

@@ -1,40 +1,42 @@
-FROM node:24.12.0-alpine3.23 AS node
+# syntax=docker/dockerfile:1.10
 
-FROM golang:1.25.5-alpine3.23 AS golang
+ARG ALPINE_VERSION=3.23
+ARG NODE_VERSION=24.12.0
+ARG GO_VERSION=1.26.2
 
-FROM node AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS frontend-builder
 WORKDIR /app
-RUN apk add pnpm
-COPY frontend /app
-RUN rm -rf /app/node_modules
+RUN corepack enable
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
-
-# Build spa
-FROM frontend-builder AS spa-builder
-RUN npx vite build --outDir /app/dist
+COPY frontend /app
+RUN pnpm exec vite build --outDir /app/dist
 
 # Build app
-FROM golang AS builder
-RUN apk add --no-cache upx=5.0.2-r0
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 WORKDIR /app
+ARG TARGETOS
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates
 COPY go.mod .
 COPY go.sum .
 RUN go mod download
 COPY . .
 RUN rm -rf /app/internal/router/dist
-COPY --from=spa-builder /app/dist /app/internal/router/dist
-RUN go build -v -ldflags="-s"
-RUN upx /app/rest-geoip
+COPY --from=frontend-builder /app/dist /app/internal/router/dist
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath -ldflags="-s -w" -o /out/rest-geoip .
 
 # dev docker image
-FROM golang AS dev
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS dev
 RUN go install github.com/air-verse/air@v1.63.6
 EXPOSE 1323
 WORKDIR /app
 
 # Main docker image
-FROM alpine:3.23
-COPY --from=builder /app/rest-geoip /usr/bin/
-ENV RELEASE_MODE=true
+FROM alpine:${ALPINE_VERSION}
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /out/rest-geoip /usr/bin/rest-geoip
+ENV GOIP_PROGRAM__RELEASE_MODE=true
 EXPOSE 1323
 CMD ["/usr/bin/rest-geoip"]
