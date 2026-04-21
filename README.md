@@ -59,9 +59,13 @@ $ docker buildx build --load -t rest-geoip:local .
 
 ```bash
 $ docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t rest-geoip:latest \
-  --push .
+    --builder multiarch \
+    -t michibiki/rest-geoip:1.4.0 \
+    --platform=linux/amd64,linux/arm64 \
+    --provenance=mode=max \
+    --sbom=true \
+    --push \
+    ./
 ```
 
 The CI workflows now build `linux/amd64` and `linux/arm64` images the same way.
