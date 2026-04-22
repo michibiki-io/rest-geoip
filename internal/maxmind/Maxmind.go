@@ -16,6 +16,7 @@ import (
 
 // DB struct
 type DB struct {
+	mu sync.RWMutex
 	db *maxminddb.Reader
 }
 
@@ -54,7 +55,7 @@ type Record struct {
 
 // Open a maxmind database
 func (m *DB) Open() error {
-	dbLocation := config.Details().Maxmind.DBLocation + config.Details().Maxmind.DBFileName
+	dbLocation := filepath.Join(config.Details().Maxmind.DBLocation, config.Details().Maxmind.DBFileName)
 	fmt.Printf("Opening db %s\n", dbLocation)
 
 	_, err := os.Stat(dbLocation)
@@ -63,32 +64,65 @@ func (m *DB) Open() error {
 			e := errortypes.NewErrorDatabaseNotFound(err, dbLocation)
 			return fmt.Errorf("maxmind.Open: db not found: %w", e)
 		}
+		return fmt.Errorf("maxmind.Open: stat failed: %w", err)
 	}
-	m.db, err = maxminddb.Open(dbLocation)
+	db, err := maxminddb.Open(dbLocation)
 	if err != nil {
-		return fmt.Errorf("%w", err)
+		return fmt.Errorf("maxmind.Open: %w", err)
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.db != nil {
+		if err := m.db.Close(); err != nil {
+			return fmt.Errorf("maxmind.Open: close previous db: %w", err)
+		}
+	}
+	m.db = db
+
 	return nil
 }
 
 // Close a maxmind database
 func (m *DB) Close() error {
-	return m.db.Close()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.db == nil {
+		return nil
+	}
+
+	if err := m.db.Close(); err != nil {
+		return err
+	}
+
+	m.db = nil
+	return nil
 }
 
 func (m *DB) Update() error {
 	if config.Details().Maxmind.LicenseKey == "" {
-		return fmt.Errorf("Error: Can't update database when no license key is set (MAXMIND_LICENSE env var needs to be set)")
+		return fmt.Errorf("Error: can't update database when no license key is set (GOIP_MAXMIND__LICENSE_KEY needs to be set)")
 	}
-	if m == nil {
-		err := m.Close()
-		if err != nil {
-			fmt.Println("Failed to close maxmind database")
-			return err
-		}
+
+	dbLocation := filepath.Join(config.Details().Maxmind.DBLocation, config.Details().Maxmind.DBFileName)
+	_, statErr := os.Stat(dbLocation)
+	hadExistingDB := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("maxmind.Update: stat failed: %w", statErr)
+	}
+
+	if err := m.Close(); err != nil {
+		fmt.Println("Failed to close maxmind database")
+		return err
 	}
 	if err := DownloadAndUpdate(); err != nil {
 		fmt.Println("Failed to update maxmind database")
+		if hadExistingDB {
+			if reopenErr := m.Open(); reopenErr != nil {
+				return fmt.Errorf("maxmind.Update: update failed: %w; reopen failed: %w", err, reopenErr)
+			}
+		}
 		return err
 	}
 	if err := m.Open(); err != nil {
@@ -103,7 +137,18 @@ func (m *DB) Update() error {
 func (m *DB) Lookup(ip net.IP) (Record, error) {
 	var record Record
 
-	err := m.db.Lookup(ip, &record)
+	if ip == nil {
+		return record, fmt.Errorf("invalid IP address")
+	}
+
+	m.mu.RLock()
+	db := m.db
+	m.mu.RUnlock()
+	if db == nil {
+		return record, fmt.Errorf("maxmind database is not open")
+	}
+
+	err := db.Lookup(ip, &record)
 	if err != nil {
 		return record, err
 	}
@@ -122,15 +167,26 @@ func GetInstance() *DB {
 
 // DownloadAndUpdate the maxmind database
 func DownloadAndUpdate() error {
-	// TODO: check that db is closed
+	dbDir := filepath.Clean(config.Details().Maxmind.DBLocation)
+	if err := os.MkdirAll(dbDir, 0750); err != nil {
+		return fmt.Errorf("maxmind.DownloadAndUpdate: mkdir db dir: %w", err)
+	}
+
+	workDir, err := os.MkdirTemp(dbDir, ".maxmind-update-*")
+	if err != nil {
+		return fmt.Errorf("maxmind.DownloadAndUpdate: create work dir: %w", err)
+	}
+	defer os.RemoveAll(workDir)
+
 	dbURL := "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=" + config.Details().Maxmind.LicenseKey + "&suffix=tar.gz"
 	md5URL := "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=" + config.Details().Maxmind.LicenseKey + "&suffix=tar.gz.md5"
-	dbDest := config.Details().Maxmind.DBLocation + "/Geolite.tar.gz"
-	md5Dest := config.Details().Maxmind.DBLocation + "/Geolite.tar.gz.md5"
+	dbDest := filepath.Join(workDir, "Geolite.tar.gz")
+	md5Dest := filepath.Join(workDir, "Geolite.tar.gz.md5")
+	extractDir := filepath.Join(workDir, "extract")
 
 	// Make channels to pass errors in WaitGroup
-	downloadErrors := make(chan error)
-	wgDone := make(chan bool)
+	downloadErrors := make(chan error, 2)
+	wgDone := make(chan struct{})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -163,33 +219,31 @@ func DownloadAndUpdate() error {
 	if err != nil {
 		return err
 	}
+	defer r.Close()
 
-	if err := fs.ExtractTarGz(r, config.Details().Maxmind.DBLocation); err != nil {
+	if err := fs.ExtractTarGz(r, extractDir); err != nil {
 		return err
 	}
 
-	// Move mmdb to MAXMIND_DB_LOCATION
-	geoCityDBPath, _, err := fs.FindFile(config.Details().Maxmind.DBLocation, "mmdb$")
+	// Move mmdb to the configured database location
+	geoCityDBPath, _, err := fs.FindFile(extractDir, `\.mmdb$`)
 	if err != nil {
 		return err
 	}
 
-	if err = fs.MoveFile(geoCityDBPath, config.Details().Maxmind.DBLocation+"/"+config.Details().Maxmind.DBFileName); err != nil {
+	destPath := filepath.Join(config.Details().Maxmind.DBLocation, config.Details().Maxmind.DBFileName)
+	if err = fs.InstallFileAtomically(geoCityDBPath, destPath, validateDBFile); err != nil {
 		return err
-	}
-
-	// Remove all temporary downloaded files
-	matches, err := filepath.Glob(config.Details().Maxmind.DBLocation + "GeoLite2-City_*")
-	if err != nil {
-		return err
-	}
-	matches = append(matches, dbDest)
-	matches = append(matches, md5Dest)
-	for _, v := range matches {
-		if err := os.RemoveAll(v); err != nil {
-			return err
-		}
 	}
 
 	return nil
+}
+
+func validateDBFile(path string) error {
+	db, err := maxminddb.Open(filepath.Clean(path))
+	if err != nil {
+		return fmt.Errorf("maxmind validate: %w", err)
+	}
+
+	return db.Close()
 }

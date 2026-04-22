@@ -18,7 +18,7 @@ func main() {
 
 	if err != nil {
 		var ErrDatabaseNotFound *errortypes.ErrorDatabaseNotFound
-		if errors.As(errors.Unwrap(err), &ErrDatabaseNotFound) {
+		if errors.As(err, &ErrDatabaseNotFound) {
 			fmt.Println(err)
 			fmt.Println("Attempting to fetch database")
 			fetchErr := maxmind.GetInstance().Update()

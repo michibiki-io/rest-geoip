@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"rest-geoip/internal/hash"
+	"strings"
 	"sync"
 )
 
@@ -42,6 +43,9 @@ func FindFile(root, r string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	if foundPath == "" {
+		return "", "", fmt.Errorf("no file matching %q found under %q", r, root)
+	}
 	return foundPath, foundName, nil
 }
 
@@ -62,8 +66,14 @@ func VerifyMD5HashFromFile(file, md5sumFile string) error {
 		return err
 	}
 
-	if fmt.Sprintf("%x", actual) != fmt.Sprintf("%s", expected) {
-		return err
+	fields := strings.Fields(string(expected))
+	if len(fields) == 0 {
+		return fmt.Errorf("md5 file %q did not contain a checksum", md5sumFile)
+	}
+
+	actualChecksum := fmt.Sprintf("%x", actual)
+	if actualChecksum != fields[0] {
+		return fmt.Errorf("md5 checksum mismatch: expected %s, got %s", fields[0], actualChecksum)
 	}
 
 	return nil
@@ -75,8 +85,13 @@ func ExtractTarGz(r io.Reader, dest string) error {
 	if err != nil {
 		return fmt.Errorf("Stream requires gzip-compressed body: %v", err)
 	}
+	defer zr.Close()
 
 	tr := tar.NewReader(zr)
+	cleanDest := filepath.Clean(dest)
+	if err := os.MkdirAll(cleanDest, 0750); err != nil {
+		return fmt.Errorf("ExtractTarGz: MkdirAll() failed: %v", err)
+	}
 
 	for {
 		f, err := tr.Next()
@@ -87,13 +102,22 @@ func ExtractTarGz(r io.Reader, dest string) error {
 			return fmt.Errorf("Tar error: %v", err)
 		}
 
+		targetPath, err := safeArchivePath(cleanDest, f.Name)
+		if err != nil {
+			return err
+		}
+
 		switch f.Typeflag {
 		case tar.TypeDir:
-			if err := os.Mkdir(dest+f.Name, 0750); err != nil {
-				return fmt.Errorf("ExtractTarGz: Mkdir() failed: %v", err)
+			if err := os.MkdirAll(targetPath, 0750); err != nil {
+				return fmt.Errorf("ExtractTarGz: MkdirAll() failed: %v", err)
 			}
 		case tar.TypeReg:
-			outFile, err := os.Create(dest + f.Name)
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
+				return fmt.Errorf("ExtractTarGz: MkdirAll() failed: %v", err)
+			}
+
+			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 			if err != nil {
 				return fmt.Errorf("ExtractTarGz: Create() failed: %v", err)
 			}
@@ -107,7 +131,7 @@ func ExtractTarGz(r io.Reader, dest string) error {
 			}
 		default:
 			return fmt.Errorf(
-				"ExtractTarGz: %s has uknown type: %v",
+				"ExtractTarGz: %s has unknown type: %v",
 				f.Name,
 				f.Typeflag)
 		}
@@ -116,20 +140,58 @@ func ExtractTarGz(r io.Reader, dest string) error {
 	return nil
 }
 
-// MoveFile moves a file
-func MoveFile(source, dest string) error {
-	// #nosec G304
-	input, err := os.ReadFile(source)
+// InstallFileAtomically copies source into a temporary file in the destination
+// directory, optionally validates it, and then atomically renames it into place.
+func InstallFileAtomically(source, dest string, validate func(string) error) (retErr error) {
+	cleanSource := filepath.Clean(source)
+	cleanDest := filepath.Clean(dest)
+
+	in, err := os.Open(cleanSource) // #nosec G304
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	destDir := filepath.Dir(cleanDest)
+	if err := os.MkdirAll(destDir, 0750); err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(destDir, "."+filepath.Base(cleanDest)+".tmp-*")
 	if err != nil {
 		return err
 	}
 
-	err = os.WriteFile(dest, input, 0600)
-	if err != nil {
+	tmpPath := tmpFile.Name()
+	defer func() {
+		if retErr != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := io.Copy(tmpFile, in); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 
-	return nil
+	if validate != nil {
+		if err := validate(tmpPath); err != nil {
+			return err
+		}
+	}
+
+	if err := os.Rename(tmpPath, cleanDest); err != nil {
+		return err
+	}
+
+	return syncDir(destDir)
 }
 
 // Download a file
@@ -166,4 +228,26 @@ func Download(url, dest string, wg *sync.WaitGroup, errChannel chan<- error) {
 	if err = out.Close(); err != nil {
 		errChannel <- err
 	}
+}
+
+func safeArchivePath(root, name string) (string, error) {
+	targetPath := filepath.Join(root, filepath.Clean(name))
+	relPath, err := filepath.Rel(root, targetPath)
+	if err != nil {
+		return "", fmt.Errorf("ExtractTarGz: Rel() failed: %v", err)
+	}
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("ExtractTarGz: illegal archive path %q", name)
+	}
+	return targetPath, nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(filepath.Clean(path)) // #nosec G304
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	return dir.Sync()
 }

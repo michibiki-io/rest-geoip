@@ -1,6 +1,8 @@
 module rest-geoip
 
-go 1.25.5
+go 1.26.0
+
+toolchain go1.26.2
 
 require (
 	github.com/didip/tollbooth/v7 v7.0.2
