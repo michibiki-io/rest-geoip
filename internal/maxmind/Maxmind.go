@@ -104,12 +104,25 @@ func (m *DB) Update() error {
 	if config.Details().Maxmind.LicenseKey == "" {
 		return fmt.Errorf("Error: can't update database when no license key is set (GOIP_MAXMIND__LICENSE_KEY needs to be set)")
 	}
+
+	dbLocation := filepath.Join(config.Details().Maxmind.DBLocation, config.Details().Maxmind.DBFileName)
+	_, statErr := os.Stat(dbLocation)
+	hadExistingDB := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("maxmind.Update: stat failed: %w", statErr)
+	}
+
 	if err := m.Close(); err != nil {
 		fmt.Println("Failed to close maxmind database")
 		return err
 	}
 	if err := DownloadAndUpdate(); err != nil {
 		fmt.Println("Failed to update maxmind database")
+		if hadExistingDB {
+			if reopenErr := m.Open(); reopenErr != nil {
+				return fmt.Errorf("maxmind.Update: update failed: %w; reopen failed: %w", err, reopenErr)
+			}
+		}
 		return err
 	}
 	if err := m.Open(); err != nil {
@@ -154,11 +167,22 @@ func GetInstance() *DB {
 
 // DownloadAndUpdate the maxmind database
 func DownloadAndUpdate() error {
-	// TODO: check that db is closed
+	dbDir := filepath.Clean(config.Details().Maxmind.DBLocation)
+	if err := os.MkdirAll(dbDir, 0750); err != nil {
+		return fmt.Errorf("maxmind.DownloadAndUpdate: mkdir db dir: %w", err)
+	}
+
+	workDir, err := os.MkdirTemp(dbDir, ".maxmind-update-*")
+	if err != nil {
+		return fmt.Errorf("maxmind.DownloadAndUpdate: create work dir: %w", err)
+	}
+	defer os.RemoveAll(workDir)
+
 	dbURL := "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=" + config.Details().Maxmind.LicenseKey + "&suffix=tar.gz"
 	md5URL := "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=" + config.Details().Maxmind.LicenseKey + "&suffix=tar.gz.md5"
-	dbDest := filepath.Join(config.Details().Maxmind.DBLocation, "Geolite.tar.gz")
-	md5Dest := filepath.Join(config.Details().Maxmind.DBLocation, "Geolite.tar.gz.md5")
+	dbDest := filepath.Join(workDir, "Geolite.tar.gz")
+	md5Dest := filepath.Join(workDir, "Geolite.tar.gz.md5")
+	extractDir := filepath.Join(workDir, "extract")
 
 	// Make channels to pass errors in WaitGroup
 	downloadErrors := make(chan error, 2)
@@ -197,32 +221,29 @@ func DownloadAndUpdate() error {
 	}
 	defer r.Close()
 
-	if err := fs.ExtractTarGz(r, config.Details().Maxmind.DBLocation); err != nil {
+	if err := fs.ExtractTarGz(r, extractDir); err != nil {
 		return err
 	}
 
 	// Move mmdb to the configured database location
-	geoCityDBPath, _, err := fs.FindFile(config.Details().Maxmind.DBLocation, "mmdb$")
+	geoCityDBPath, _, err := fs.FindFile(extractDir, `\.mmdb$`)
 	if err != nil {
 		return err
 	}
 
-	if err = fs.MoveFile(geoCityDBPath, filepath.Join(config.Details().Maxmind.DBLocation, config.Details().Maxmind.DBFileName)); err != nil {
+	destPath := filepath.Join(config.Details().Maxmind.DBLocation, config.Details().Maxmind.DBFileName)
+	if err = fs.InstallFileAtomically(geoCityDBPath, destPath, validateDBFile); err != nil {
 		return err
-	}
-
-	// Remove all temporary downloaded files
-	matches, err := filepath.Glob(filepath.Join(config.Details().Maxmind.DBLocation, "GeoLite2-City_*"))
-	if err != nil {
-		return err
-	}
-	matches = append(matches, dbDest)
-	matches = append(matches, md5Dest)
-	for _, v := range matches {
-		if err := os.RemoveAll(v); err != nil {
-			return err
-		}
 	}
 
 	return nil
+}
+
+func validateDBFile(path string) error {
+	db, err := maxminddb.Open(filepath.Clean(path))
+	if err != nil {
+		return fmt.Errorf("maxmind validate: %w", err)
+	}
+
+	return db.Close()
 }
